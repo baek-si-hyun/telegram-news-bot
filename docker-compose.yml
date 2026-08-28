@@ -1,0 +1,20 @@
+name: telegram-news-bot
+
+services:
+  news-bot:
+    build: .
+    container_name: telegram-news-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./storage:/app/storage
+      - ./logs:/app/logs
+    environment:
+      - TZ=Asia/Seoul
+    healthcheck:
+      test: ["CMD", "python", "-c", "import os, time; t=os.path.getmtime('/app/logs/bot.log'); exit(0 if time.time()-t < 3600 else 1)"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 1m

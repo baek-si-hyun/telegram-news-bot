@@ -1,0 +1,56 @@
+# 환경변수 (API 키 포함 - 절대 커밋 금지)
+.env
+
+# 캐시/대기큐 데이터 (토픽별)
+storage/*/sent_news.json
+storage/*/pending_news.json
+
+# 사용자 추가/삭제 키워드 & 명령 폴링 오프셋
+storage/*/keywords.json
+storage/updates_offset.json
+
+# 학습 모델/리포트
+ml/models/*.pkl
+ml/reports/*.txt
+
+# 로그
+logs/*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# 수집 히스토리 (토픽별 월별 jsonl) — 운영 데이터이며 수 GB 단위다. 절대 커밋 금지
+storage/*/history/
+
+# 국토부 보도자료 중복제거 상태
+storage/*/molit_seen.json
+
+# 일회성 이관 스크립트가 남긴 데이터
+storage/_dump.json
+storage/_lookup.json
+storage/_repost_progress.txt
+
+# 필터 튜닝 때 떨군 결과 덤프
+test_results.json
+
+# 로그 디렉터리 전체 (main.py 가 기동 시 만든다)
+logs/
