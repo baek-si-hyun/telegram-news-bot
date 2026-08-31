@@ -1,4 +1,5 @@
 import logging
+import unified
 from crawler import naver, molit
 from bot import telegram, commands
 from storage import cache, pending, keywords as kwstore
@@ -50,6 +51,8 @@ def _send_topic(topic_key: str, profile: dict):
     for news in news_list:
         if telegram.send_news(news, profile["bot_token"], profile["chat_ids"]):
             sent += 1
+            # 통합 포스팅 앱에도 같이 적는다. 실패해도 여기서 멈추지 않는다(unified.push 는 예외를 올리지 않는다).
+            unified.push(news, topic_key)
     logger.info(f"[{topic_key}] 텔레그램 전송 완료: {sent}/{len(news_list)}건")
 
 
@@ -72,7 +75,22 @@ def _molit_topic(topic_key: str, profile: dict):
     for news in items:
         if telegram.send_news(news, profile["bot_token"], profile["chat_ids"]):
             sent += 1
+            # 국토부 보도자료도 앱으로 같이 넘긴다 — history JSONL 에는 네이버 기사만 남아서,
+            # 여기서 안 넘기면 앱의 부동산 목록에서 보도자료만 통째로 빠진다.
+            unified.push(news, topic_key)
     logger.info(f"[MOLIT:{topic_key}] 보도자료 전송 완료: {sent}/{len(items)}건")
+
+
+def _alert(topic_key: str, profile: dict, text: str) -> None:
+    """운영 장애를 해당 토픽 채널로 알린다.
+
+    telegram.send_alert 는 구현돼 있었지만 호출부가 한 곳도 없어서, 43시간 정지가
+    아무에게도 통보되지 않았다. 알림 전송 자체가 실패해도 본 흐름을 막지 않는다.
+    """
+    try:
+        telegram.send_alert(text, profile["bot_token"], profile["chat_ids"])
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"[알림:{topic_key}] 알림 전송 실패: {e}")
 
 
 def run_cycle():
@@ -86,17 +104,20 @@ def run_cycle():
             _molit_topic(topic_key, profile)
         except Exception as e:
             logger.error(f"[MOLIT:{topic_key}] 처리 중 오류: {e}")
+            _alert(topic_key, profile, f"국토부 보도자료 처리 실패: {e}")
 
         try:
             _collect_topic(topic_key, profile)
         except Exception as e:
             logger.error(f"[수집:{topic_key}] 처리 중 오류: {e}")
+            _alert(topic_key, profile, f"뉴스 수집 실패 — 이번 주기 건너뜀: {e}")
             continue
 
         try:
             _send_topic(topic_key, profile)
         except Exception as e:
             logger.error(f"[전송:{topic_key}] 처리 중 오류: {e}")
+            _alert(topic_key, profile, f"텔레그램 전송 실패: {e}")
 
 
 def collect():
