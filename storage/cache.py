@@ -11,8 +11,20 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# 제목 유사도 임계값 (0.0~1.0)
+# 제목 유사도 임계값 (0.0~1.0).
+# 실측 라벨셋에서 '다른 기사' 쌍의 최대 ratio 가 0.417 이라 0.55 는 원래 안전했다.
+# 오탐의 원인은 이 값이 아니라 아래 최장공통부분 규칙이었으므로 그대로 둔다.
 SIMILARITY_THRESHOLD = 0.55
+
+# 키워드 겹침 비율 임계값 (2글자 n-gram 집합 기준).
+# 라벨셋 분리점: '다른 기사' 최대 0.364 vs '같은 사안' 최소 0.467 → 0.45.
+WORD_OVERLAP_THRESHOLD = 0.45
+
+# 최장 공통부분 판정의 최소 길이 및 짧은 제목 대비 최소 비율.
+# 예전에는 '7글자만 겹치면 중복'이라 '원조부촌워커힐'·'토지거래허가구역'·'부동산AtoZ'
+# 같은 흔한 어구 하나로 전혀 다른 기사가 무더기로 폐기됐다(8월 통과분의 47%).
+MIN_LCS_LEN = 12
+MIN_LCS_RATIO = 0.6
 
 # 유사도 비교 대상 최대 건수 (성능 보호)
 MAX_SIMILARITY_COMPARE = 500
@@ -42,7 +54,11 @@ def _extract_words(normalized: str) -> set[str]:
 
 
 def _is_similar(title_a: str, title_b: str) -> bool:
-    """두 정규화된 제목이 유사한지 판별 (시퀀스 유사도 + 키워드 겹침)"""
+    """두 정규화된 제목이 유사한지 판별 (시퀀스 유사도 + 키워드 겹침).
+
+    목적은 '같은 사안을 여러 언론사가 쓴 기사'를 한 건으로 묶는 것이지, 흔한 어구를
+    공유하는 별개 기사를 지우는 것이 아니다. 세 규칙 모두 후자로 기울어 있었다.
+    """
     if not title_a or not title_b:
         return False
     if SequenceMatcher(None, title_a, title_b).ratio() >= SIMILARITY_THRESHOLD:
@@ -52,10 +68,13 @@ def _is_similar(title_a: str, title_b: str) -> bool:
     if words_a and words_b:
         overlap = len(words_a & words_b)
         min_len = min(len(words_a), len(words_b))
-        if overlap / min_len >= 0.5:
+        if overlap / min_len >= WORD_OVERLAP_THRESHOLD:
             return True
+    # 최장 공통부분은 '길이 12자 이상'이면서 '짧은 쪽 제목의 60% 이상'일 때만 중복으로 본다.
+    # 고정 7자 기준은 지역명·제도명 한 덩어리만 겹쳐도 걸려 오탐이 압도적이었다.
     match = SequenceMatcher(None, title_a, title_b).find_longest_match(0, len(title_a), 0, len(title_b))
-    return match.size >= 7
+    shorter = min(len(title_a), len(title_b))
+    return match.size >= MIN_LCS_LEN and match.size >= shorter * MIN_LCS_RATIO
 
 
 def _load(topic: str) -> dict:

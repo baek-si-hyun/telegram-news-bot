@@ -2,4 +2,7 @@ requests==2.32.3
 python-dotenv==1.0.1
 schedule==1.2.2
 beautifulsoup4==4.12.3
-scikit-learn>=1.8.0
+# 모델 pickle 은 sklearn 버전에 묶인다. 호스트에서 학습해 이미지에 굽는 구조라
+# (ml/models/*.pkl 이 COPY . . 로 들어간다) 학습 환경과 런타임 버전이 어긋나면
+# 언피클이 깨진다. 그래서 범위가 아니라 고정이다.
+scikit-learn==1.8.0

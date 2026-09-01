@@ -24,6 +24,7 @@ import time
 
 import requests
 
+from bot import telegram
 from config import ADMIN_IDS, TOPICS, active_topics
 from storage import keywords as kwstore
 
@@ -123,7 +124,7 @@ def _get_updates(token: str, offset: int) -> list[dict]:
             return []
         return resp.json().get("result", [])
     except requests.RequestException as e:
-        logger.warning(f"[명령] getUpdates 오류: {e}")
+        logger.warning(f"[명령] getUpdates 오류: {telegram.mask_token(e)}")
         time.sleep(3)
         return []
 

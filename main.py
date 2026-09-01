@@ -70,6 +70,15 @@ def main():
 
     logger.info(f"스케줄: 30분마다 수집→즉시 전송 / 명령안내 {PROMO_TIME}")
 
+    # 기동 직후 1회 즉시 수집.
+    # schedule 은 첫 실행을 30분 뒤로 잡기 때문에, 재기동할 때마다 30분 공백이 생겼다.
+    # 네이버는 키워드당 최신 30건만 주므로 그 공백은 그대로 기사 유실이 된다.
+    logger.info("기동 직후 1회 수집 실행")
+    try:
+        run_cycle()
+    except Exception as e:  # noqa: BLE001
+        logger.error(f"기동 직후 수집 실패: {e}")
+
     while _running:
         schedule.run_pending()
         time.sleep(10)

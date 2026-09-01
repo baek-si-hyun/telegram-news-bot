@@ -1,15 +1,60 @@
 import logging
 import unified
-from crawler import naver, molit
+from crawler import naver, molit, body
 from bot import telegram, commands
+from ml import classifier
 from storage import cache, pending, keywords as kwstore
 from config import active_topics
 
 logger = logging.getLogger(__name__)
 
 
+def _refine_with_body(news_list: list[dict], topic_key: str, profile: dict) -> list[dict]:
+    """본문을 받아 최종 판정한다 (본문 모델이 있는 토픽만).
+
+    수집 단계는 '잠정 통과선'만 적용했다. 여기서 본문을 받아 다시 판정해 최종 결정을 내린다.
+    제목+스니펫 121자만으로는 '부동산 정책 기사'와 '부동산을 소재로 쓴 정치 기사'가 잘
+    안 갈리는데, 본문을 넣으면 같은 정밀도(82%)에서 재현율이 62.2% → 68.3% 로 오른다.
+
+    본문을 못 받거나 본문 모델이 실패하면 **스니펫 판정을 그대로 쓴다** — 외부 사이트
+    사정이 뉴스 전송을 막지 않아야 한다.
+    """
+    if not (profile.get("use_body_model") and classifier.has_body_model(topic_key)):
+        return news_list
+    if not news_list:
+        return news_list
+
+    snip_cut = classifier.cutoff(topic_key) or 0.5
+    body_cut = classifier.body_cutoff(topic_key) or 0.5
+    prio_cut = profile.get("ml_priority_cutoff")
+
+    bodies = body.fetch_many([n.get("url") for n in news_list])
+
+    kept, dropped = [], 0
+    for n in news_list:
+        text = bodies.get(n.get("url", ""), "")
+        p_body = classifier.predict_body(n.get("title", ""), n.get("description", ""),
+                                         topic_key, text, n.get("rule_score"))
+        if p_body is None:
+            # 본문 없음 → 스니펫 확률로 최종 판정 (수집 때는 잠정선만 통과한 상태)
+            prob, cut, src = n.get("ml_prob"), snip_cut, "스니펫"
+        else:
+            prob, cut, src = p_body, body_cut, "본문"
+        if n.get("ml_priority") and prio_cut is not None:
+            cut = prio_cut
+        if prob is None or prob >= cut:
+            n["final_prob"] = prob
+            n["decided_by"] = src
+            kept.append(n)
+        else:
+            dropped += 1
+
+    logger.info(f"[{topic_key}] 본문 재판정: {len(news_list)}건 → 통과 {len(kept)}건 (컷 {dropped}건)")
+    return kept
+
+
 def _collect_topic(topic_key: str, profile: dict):
-    """단일 토픽 수집: 뉴스 검색 → 중복 제거 → 대기 큐 저장"""
+    """단일 토픽 수집: 뉴스 검색 → 중복 제거 → 본문 재판정 → 대기 큐 저장"""
     # 사용자가 /add·/del 로 넣고 뺀 키워드를 config 위에 병합(매 주기 최신 반영)
     profile = kwstore.apply(profile, topic_key)
     logger.info(f"[{topic_key}] 뉴스 수집 시작 (키워드 {len(profile['keywords'])}개)")
@@ -29,10 +74,23 @@ def _collect_topic(topic_key: str, profile: dict):
             logger.info(f"[{topic_key}] '{keyword}' 신규 뉴스 없음")
             continue
 
+        # 본문 재판정은 중복 제거 '뒤'에 둔다 — 매 주기 1,200건을 다 받으면 주기를 넘긴다.
+        # 여기까지 온 건 이번 주기의 신규분뿐이라 요청 수가 감당 가능한 수준으로 떨어진다.
+        try:
+            new_news = _refine_with_body(new_news, topic_key, profile)
+        except Exception as e:  # noqa: BLE001 — 본문 단계는 절대 수집을 막지 않는다
+            logger.error(f"[{topic_key}] 본문 재판정 오류, 스니펫 판정 사용: {e}")
+
+        # 판정에서 탈락한 것도 '이미 본 기사'로 기록해 다음 주기에 본문을 또 받지 않게 한다.
+        for n in results:
+            collected_this_cycle.add(n.get("url"))
+
+        if not new_news:
+            logger.info(f"[{topic_key}] '{keyword}' 본문 재판정 후 남은 뉴스 없음")
+            continue
+
         pending.add(new_news, topic_key)
         cache.mark_all_sent(new_news, topic_key)
-        for n in new_news:
-            collected_this_cycle.add(n.get("url"))
 
         logger.info(f"[{topic_key}] '{keyword}' {len(new_news)}건 수집")
 

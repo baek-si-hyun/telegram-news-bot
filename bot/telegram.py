@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import logging
 import requests
@@ -26,6 +27,16 @@ _photo_file_ids: dict[str, str] = {}
 
 def _api_url(bot_token: str) -> str:
     return f"https://api.telegram.org/bot{bot_token}"
+
+
+# requests 예외 메시지에는 요청 URL 이 그대로 들어가고, 그 URL 에는 /bot<토큰>/ 이 박혀 있다.
+# 실제로 logs/bot.log.2 에 현역 봇 토큰이 평문으로 남아 있었다. 로그로 나가기 전에 가린다.
+_TOKEN_IN_URL = re.compile(r"(/bot)(\d+:[A-Za-z0-9_-]+)")
+
+
+def mask_token(text) -> str:
+    """로그 문자열에서 텔레그램 봇 토큰을 가린다."""
+    return _TOKEN_IN_URL.sub(r"\1***", str(text))
 
 
 def _escape_html(text: str) -> str:
@@ -77,7 +88,7 @@ def _send_to_chat(bot_token: str, chat_id: str, text: str, retry: int = 3) -> bo
                 logger.error(f"[Telegram] 전송 실패 chat={chat_id} {response.status_code}: {response.text}")
                 return False
         except requests.RequestException as e:
-            logger.error(f"[Telegram] 요청 오류 chat={chat_id} 시도 {attempt}/{retry}: {e}")
+            logger.error(f"[Telegram] 요청 오류 chat={chat_id} 시도 {attempt}/{retry}: {mask_token(e)}")
             if attempt < retry:
                 time.sleep(2 ** attempt)
 
@@ -159,7 +170,7 @@ def _send_photo_to_chat(bot_token: str, chat_id: str, caption: str, retry: int =
             return False
 
         except (requests.RequestException, OSError) as e:
-            logger.error(f"[Telegram] 사진 요청 오류 chat={chat_id} 시도 {attempt}/{retry}: {e}")
+            logger.error(f"[Telegram] 사진 요청 오류 chat={chat_id} 시도 {attempt}/{retry}: {mask_token(e)}")
             if attempt < retry:
                 time.sleep(2 ** attempt)
 
