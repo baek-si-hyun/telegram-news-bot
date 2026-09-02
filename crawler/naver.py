@@ -2,7 +2,8 @@ import time
 import logging
 import re
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from config import (
     NAVER_CLIENT_ID, NAVER_CLIENT_SECRET, NEWS_DISPLAY_COUNT, REQUEST_DELAY_SECONDS,
 )
@@ -80,6 +81,19 @@ def _remember(record: dict, topic_key: str, sink: list[dict]) -> None:
     sink.append(record)
 
 
+def _article_age_days(pub_date: str):
+    """기사 발행 후 경과 일수. 파싱 실패하면 None (그 경우 나이로 거르지 않는다)."""
+    if not pub_date:
+        return None
+    try:
+        dt = parsedate_to_datetime(pub_date)
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - dt).days
+
+
 def _clean_html(text: str) -> str:
     """HTML 태그 및 특수문자 제거"""
     text = re.sub(r"<[^>]+>", "", text)
@@ -151,6 +165,10 @@ def search(keyword: str, query: str, profile: dict, topic_key: str) -> list[dict
     priority_terms = profile.get("ml_priority_terms") or bypass_terms
     priority_cut = profile.get("ml_priority_cutoff")
     priority_delta = profile.get("ml_priority_cutoff_delta", 0.12)
+    # 기사 신선도 상한. pub_date 를 수집만 하고 판정에 안 써서, 캐시가 만료된(45일)
+    # 오래된 기사가 다시 '신규'로 잡혀 나가고 있었다 — 실측상 발송분의 4.3% 가 90일 초과,
+    # 최고령 1,105일(3년)이었다. 저물량 키워드일수록 네이버가 옛 기사를 돌려줘 심해진다.
+    max_age = profile.get("max_article_age_days")
     # 본문 2단계를 쓰는 토픽이면 수집 단계는 잠정선만 적용한다.
     provisional_cut = None
     if profile.get("use_body_model") and classifier.has_body_model(topic_key):
@@ -185,6 +203,16 @@ def search(keyword: str, query: str, profile: dict, topic_key: str) -> list[dict
             "reject_reason": None,
             "score": None,
         }
+
+        # 신선도 게이트 — 뉴스 알림 채널에 몇 달 전 기사가 새 소식처럼 나가면 안 된다.
+        # pub_date 를 못 읽으면 거르지 않는다(fail open).
+        if max_age:
+            age = _article_age_days(pub_date)
+            if age is not None and age > max_age:
+                record["age_days"] = age
+                record["reject_reason"] = "too_old"
+                _remember(record, topic_key, history_records)
+                continue
 
         # 네이버 제휴 언론사만 통과가 기본값.
         # 단, 이 게이트가 지역 언론을 통째로 잘라내 사용자 고유명사 키워드(인주역·시리물류단지
