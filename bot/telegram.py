@@ -96,12 +96,20 @@ def _send_to_chat(bot_token: str, chat_id: str, text: str, retry: int = 3) -> bo
 
 
 def _send_request(bot_token: str, chat_ids: list[str], text: str) -> bool:
-    """지정된 모든 채팅방에 메시지 전송"""
-    success = False
+    """지정된 모든 채팅방에 메시지 전송.
+
+    **모든 방에 성공했을 때만 True.** 예전에는 한 방만 성공해도 True 를 돌려줘,
+    채팅방을 여러 개 걸어둔 경우 일부 방 실패가 '전송 완료'로 묻혔다.
+    """
+    if not chat_ids:
+        return False
+    ok = 0
     for chat_id in chat_ids:
         if _send_to_chat(bot_token, chat_id, text):
-            success = True
-    return success
+            ok += 1
+    if ok and ok < len(chat_ids):
+        logger.warning(f"[Telegram] 부분 전송: {ok}/{len(chat_ids)} 방 성공")
+    return ok == len(chat_ids)
 
 
 def _build_caption(news: dict) -> str:
@@ -178,11 +186,16 @@ def _send_photo_to_chat(bot_token: str, chat_id: str, caption: str, retry: int =
 
 
 def _send_photo_request(bot_token: str, chat_ids: list[str], caption: str) -> bool:
-    success = False
+    """모든 방에 성공했을 때만 True (_send_request 와 동일 규칙)."""
+    if not chat_ids:
+        return False
+    ok = 0
     for chat_id in chat_ids:
         if _send_photo_to_chat(bot_token, chat_id, caption):
-            success = True
-    return success
+            ok += 1
+    if ok and ok < len(chat_ids):
+        logger.warning(f"[Telegram] 부분 전송(사진): {ok}/{len(chat_ids)} 방 성공")
+    return ok == len(chat_ids)
 
 
 def send_news(news: dict, bot_token: str, chat_ids: list[str]) -> bool:

@@ -119,15 +119,27 @@ def _fetch_list(session: requests.Session) -> list[dict]:
     return items
 
 
-def _fetch_dept(session: requests.Session, url: str) -> str:
-    """상세 페이지에서 '담당부서' 추출. 실패 시 빈 문자열."""
-    try:
-        resp = session.get(url, timeout=20)
-        resp.raise_for_status()
-        resp.encoding = "utf-8"
-    except requests.RequestException as e:
-        logger.warning(f"[MOLIT] 상세 조회 실패 {url[:70]}: {e}")
-        return ""
+def _fetch_dept(session: requests.Session, url: str, retry: int = 3) -> str | None:
+    """상세 페이지에서 '담당부서' 추출.
+
+    반환값 구분이 중요하다.
+      · 문자열  — 조회 성공 (빈 문자열이면 담당부서 표기가 없는 것)
+      · None    — 조회 자체 실패. 이 경우 호출 측은 '본 것'으로 기록하지 말고
+                  다음 주기에 다시 시도해야 한다. 예전에는 실패를 빈 문자열로
+                  뭉개서 미분류로 폐기하고 재시도도 하지 않았다.
+    """
+    for attempt in range(1, retry + 1):
+        try:
+            resp = session.get(url, timeout=20)
+            resp.raise_for_status()
+            resp.encoding = "utf-8"
+            break
+        except requests.RequestException as e:
+            logger.warning(f"[MOLIT] 상세 조회 실패 {url[:70]} 시도 {attempt}/{retry}: {e}")
+            if attempt < retry:
+                time.sleep(2 ** attempt)
+            else:
+                return None
 
     soup = BeautifulSoup(resp.text, "html.parser")
     info = soup.select_one("ul.bd_view_ul_info") or soup
@@ -163,10 +175,16 @@ def fetch_new(topic_key: str, categories: list[str]) -> list[dict]:
         return []
 
     results = []
+    resolved = []          # 상세 조회에 성공한 건만 '본 것'으로 기록한다
     for item in fresh:
         dept = _fetch_dept(session, item["url"])
-        category = classify(dept, item["title"])
         time.sleep(DETAIL_DELAY)
+        if dept is None:
+            # 조회 실패 → seen 기록하지 않고 다음 주기에 재시도
+            logger.warning(f"[MOLIT:{topic_key}] 상세 조회 실패로 보류(다음 주기 재시도): {item['title'][:40]}")
+            continue
+        resolved.append(item)
+        category = classify(dept, item["title"])
 
         if category not in categories:
             logger.info(
@@ -182,15 +200,15 @@ def fetch_new(topic_key: str, categories: list[str]) -> list[dict]:
             "url": item["url"],
         })
 
-    # 신규 건은 (전송 성공 여부와 무관하게) 모두 '본 것'으로 기록 → 재전송·재조회 방지
-    cache.mark_urls_sent(fresh, topic_key, SEEN_NS)
+    # 상세 조회에 성공한 건만 '본 것'으로 기록 → 조회 실패분은 다음 주기에 재시도된다
+    cache.mark_urls_sent(resolved, topic_key, SEEN_NS)
 
     # 우선순위 정렬: categories 리스트 순서(철도 → 도로 → 택지 → 주택)
     order = {c: i for i, c in enumerate(categories)}
     results.sort(key=lambda n: order.get(n["category"], len(order)))
 
     logger.info(
-        f"[MOLIT:{topic_key}] 신규 {len(fresh)}건 중 대상 {len(results)}건: "
+        f"[MOLIT:{topic_key}] 신규 {len(fresh)}건(조회성공 {len(resolved)}) 중 대상 {len(results)}건: "
         + ", ".join(f"{n['category']}" for n in results)
     )
     return results

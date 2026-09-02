@@ -3,6 +3,7 @@ import logging
 import os
 import re
 import tempfile
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta
 from config import CACHE_EXPIRE_DAYS
@@ -35,6 +36,28 @@ def _cache_file(topic: str) -> str:
     topic_dir = os.path.join(BASE_DIR, topic)
     os.makedirs(topic_dir, exist_ok=True)
     return os.path.join(topic_dir, "sent_news.json")
+
+
+# 같은 기사인데 URL 뒤에 붙는 추적 파라미터만 달라 다른 기사로 세던 문제를 막는다.
+_TRACKING_PARAMS = ("utm_", "fbclid", "gclid", "igshid", "ref", "referer", "referrer",
+                    "from", "cmpid", "spm", "s_kwcd", "s_dept")
+
+
+def normalize_url(url: str) -> str:
+    """중복 판별용 URL 정규화 — 추적 파라미터·fragment·말미 슬래시 제거."""
+    if not url:
+        return ""
+    try:
+        u = urlsplit(url.strip())
+    except ValueError:
+        return url.strip()
+    keep = [(k, v) for k, v in parse_qsl(u.query, keep_blank_values=True)
+            if not any(k.lower().startswith(t) for t in _TRACKING_PARAMS)]
+    path = u.path.rstrip("/") or "/"
+    netloc = u.netloc.lower()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    return urlunsplit((u.scheme.lower(), netloc, path, urlencode(keep), ""))
 
 
 def _normalize_title(title: str) -> str:
@@ -119,7 +142,7 @@ def _purge_expired(data: dict, days: int = CACHE_EXPIRE_DAYS) -> dict:
 
 def _is_duplicate(item: dict, url_set: set, title_list: list[str]) -> bool:
     """URL 완전 일치 또는 제목 유사도 기반 중복 판별"""
-    url = item.get("url", "")
+    url = normalize_url(item.get("url", ""))
     title_key = _normalize_title(item.get("title", ""))
 
     if url and url in url_set:
@@ -138,7 +161,8 @@ def filter_new(news_list: list[dict], topic: str) -> list[dict]:
     data = _load(topic)
     data = _purge_expired(data)
 
-    url_set = {v["url"] for v in data.values() if isinstance(v, dict) and v.get("url")}
+    url_set = {normalize_url(v["url"]) for v in data.values()
+               if isinstance(v, dict) and v.get("url")}
     title_list = [v["title_key"] for v in data.values() if isinstance(v, dict) and v.get("title_key")]
 
     new_items = []
@@ -149,7 +173,7 @@ def filter_new(news_list: list[dict], topic: str) -> list[dict]:
         if _is_duplicate(item, seen_urls, seen_titles):
             continue
         new_items.append(item)
-        url = item.get("url", "")
+        url = normalize_url(item.get("url", ""))
         title_key = _normalize_title(item.get("title", ""))
         if url:
             seen_urls.add(url)

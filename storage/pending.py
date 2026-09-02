@@ -74,8 +74,34 @@ def add(news_list: list[dict], topic: str) -> None:
 
 
 def pop_all(topic: str) -> list[dict]:
-    """대기 큐의 모든 뉴스를 꺼내고 큐를 비움"""
+    """대기 큐의 모든 뉴스를 꺼내고 큐를 비움.
+
+    ⚠ 전송 전에 큐를 비우므로 전송 도중 프로세스가 죽으면 그 배치가 영구 유실된다.
+    새 코드는 peek_all() + remove_sent() 를 쓸 것. 하위 호환용으로만 남긴다.
+    """
     data = _load(topic)
     if data:
         _save(topic, [])
     return data
+
+
+def peek_all(topic: str) -> list[dict]:
+    """큐를 비우지 않고 내용만 읽는다."""
+    return _load(topic)
+
+
+def remove_sent(urls, topic: str) -> None:
+    """전송에 성공한 URL 만 큐에서 제거한다.
+
+    pop_all 처럼 미리 비우지 않기 때문에, 전송 중 프로세스가 죽어도 못 보낸 건이
+    큐에 남아 다음 주기에 다시 시도된다.
+    """
+    sent = {u for u in urls if u}
+    if not sent:
+        return
+    data = _load(topic)
+    remain = [item for item in data if item.get("url") not in sent]
+    if len(remain) != len(data):
+        _save(topic, remain)
+    if remain:
+        logger.info(f"[Pending:{topic}] {len(data) - len(remain)}건 제거, {len(remain)}건 미전송 잔류")

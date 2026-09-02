@@ -3,10 +3,14 @@ import unified
 from crawler import naver, molit, body
 from bot import telegram, commands
 from ml import classifier
-from storage import cache, pending, keywords as kwstore
+from storage import cache, pending, heartbeat, keywords as kwstore
 from config import active_topics
 
 logger = logging.getLogger(__name__)
+
+# 본문까지 보고 판정을 끝낸 URL 을 기억하는 네임스페이스 (storage/<topic>/body_eval_seen.json).
+# 탈락분은 sent_news 캐시에 남지 않으므로 이게 없으면 같은 기사의 본문을 매 주기 다시 받는다.
+BODY_EVAL_NS = "body_eval"
 
 
 def _refine_with_body(news_list: list[dict], topic_key: str, profile: dict) -> list[dict]:
@@ -21,6 +25,13 @@ def _refine_with_body(news_list: list[dict], topic_key: str, profile: dict) -> l
     """
     if not (profile.get("use_body_model") and classifier.has_body_model(topic_key)):
         return news_list
+    if not news_list:
+        return news_list
+
+    # 이미 본문까지 보고 탈락시킨 기사는 다시 받지 않는다.
+    # 탈락분은 캐시(sent_news)에 남지 않으므로, 이 기억이 없으면 같은 기사의 본문을
+    # 30분마다 계속 다시 받게 된다.
+    news_list = cache.filter_new_urls(news_list, topic_key, BODY_EVAL_NS)
     if not news_list:
         return news_list
 
@@ -49,6 +60,9 @@ def _refine_with_body(news_list: list[dict], topic_key: str, profile: dict) -> l
         else:
             dropped += 1
 
+    # 통과·탈락 모두 '판정 끝'으로 기록한다. 통과분은 전송 후 sent_news 에도 남지만,
+    # 여기에 같이 남겨야 전송 실패로 큐에 머무는 동안 본문을 또 받지 않는다.
+    cache.mark_urls_sent(news_list, topic_key, BODY_EVAL_NS)
     logger.info(f"[{topic_key}] 본문 재판정: {len(news_list)}건 → 통과 {len(kept)}건 (컷 {dropped}건)")
     return kept
 
@@ -89,8 +103,9 @@ def _collect_topic(topic_key: str, profile: dict):
             logger.info(f"[{topic_key}] '{keyword}' 본문 재판정 후 남은 뉴스 없음")
             continue
 
+        # 캐시 기록은 여기서 하지 않는다 — 실제 전송에 성공한 뒤 _send_topic 에서 남긴다.
+        # (수집 시점에 '전송됨'으로 찍으면 전송 실패분이 영영 재시도되지 않는다)
         pending.add(new_news, topic_key)
-        cache.mark_all_sent(new_news, topic_key)
 
         logger.info(f"[{topic_key}] '{keyword}' {len(new_news)}건 수집")
 
@@ -98,20 +113,32 @@ def _collect_topic(topic_key: str, profile: dict):
 
 
 def _send_topic(topic_key: str, profile: dict):
-    """단일 토픽 전송: 대기 큐 → 해당 토픽 텔레그램 채널"""
-    news_list = pending.pop_all(topic_key)
+    """단일 토픽 전송: 대기 큐 → 해당 토픽 텔레그램 채널.
+
+    큐를 미리 비우지 않고(peek), 전송에 성공한 건만 제거한다. 예전에는 pop_all 로
+    먼저 비웠기 때문에 전송 도중 프로세스가 죽으면 그 배치가 통째로 사라졌다.
+    캐시 기록(mark_all_sent)도 여기서 — 수집 시점이 아니라 실제로 보낸 뒤에 한다.
+    """
+    news_list = pending.peek_all(topic_key)
     if not news_list:
         logger.info(f"[{topic_key}] 전송할 뉴스 없음")
         return
 
     logger.info(f"[{topic_key}] 텔레그램 전송 시작: {len(news_list)}건")
-    sent = 0
-    for news in news_list:
-        if telegram.send_news(news, profile["bot_token"], profile["chat_ids"]):
-            sent += 1
-            # 통합 포스팅 앱에도 같이 적는다. 실패해도 여기서 멈추지 않는다(unified.push 는 예외를 올리지 않는다).
-            unified.push(news, topic_key)
-    logger.info(f"[{topic_key}] 텔레그램 전송 완료: {sent}/{len(news_list)}건")
+    sent_items = []
+    try:
+        for news in news_list:
+            if telegram.send_news(news, profile["bot_token"], profile["chat_ids"]):
+                sent_items.append(news)
+                # 통합 포스팅 앱에도 같이 적는다. 실패해도 여기서 멈추지 않는다(unified.push 는 예외를 올리지 않는다).
+                unified.push(news, topic_key)
+    finally:
+        # 도중에 예외가 나도, 이미 보낸 것까지는 큐에서 빼고 캐시에 남긴다.
+        # (안 그러면 다음 주기에 같은 기사를 다시 보낸다)
+        if sent_items:
+            cache.mark_all_sent(sent_items, topic_key)
+            pending.remove_sent([n.get("url") for n in sent_items], topic_key)
+    logger.info(f"[{topic_key}] 텔레그램 전송 완료: {len(sent_items)}/{len(news_list)}건")
 
 
 def _molit_topic(topic_key: str, profile: dict):
@@ -177,6 +204,26 @@ def run_cycle():
             logger.error(f"[전송:{topic_key}] 처리 중 오류: {e}")
             _alert(topic_key, profile, f"텔레그램 전송 실패: {e}")
 
+    # 한 주기를 끝냈다는 표시. 다음 기동 때 이 시각과 비교해 정지 구간을 알아낸다.
+    heartbeat.touch()
+
+
+def report_downtime(threshold_minutes: int = 90) -> None:
+    """직전 주기 이후 공백이 크면 각 토픽 채널에 알린다 (기동 직후 1회).
+
+    봇이 멈춰 있는 동안에는 알릴 수 없으니, 살아난 뒤에 "그동안 비어 있었다"를 알린다.
+    네이버는 키워드당 최신 30건만 주므로 긴 공백은 그대로 기사 유실이다.
+    """
+    gap = heartbeat.gap_minutes()
+    if gap is None or gap < threshold_minutes:
+        return
+    hours = gap / 60
+    msg = (f"수집이 {hours:.1f}시간 동안 중단됐다가 재개됐습니다.\n"
+           f"그 사이 기사는 네이버가 최신 30건만 주기 때문에 상당수 유실됐을 수 있습니다.")
+    logger.error(f"[가동중단] 직전 주기 이후 {hours:.1f}시간 공백 감지")
+    for topic_key, profile in active_topics().items():
+        _alert(topic_key, profile, msg)
+
 
 def collect():
     """(수동용) 모든 활성 토픽 수집만"""
@@ -199,29 +246,15 @@ def send():
 def send_help():
     """키워드 명령(/add·/del·/list) 사용법 안내를 모든 활성 토픽 채널로 전송.
 
-    기존 홍보(send_promos) 대신 이 함수를 스케줄에 건다(main.py).
+    main.py 가 주 1회 스케줄로 건다.
     """
     text = commands.help_message()
     for topic_key, profile in active_topics().items():
         try:
-            telegram.send_promo(profile["bot_token"], profile["chat_ids"], [text])
-            logger.info(f"[{topic_key}] 명령 안내 전송 완료")
+            # 반환값을 봐야 한다 — 예전에는 실패해도 '전송 완료'로 찍혔다.
+            if telegram.send_promo(profile["bot_token"], profile["chat_ids"], [text]):
+                logger.info(f"[{topic_key}] 명령 안내 전송 완료")
+            else:
+                logger.warning(f"[{topic_key}] 명령 안내 전송 실패")
         except Exception as e:
             logger.error(f"[안내:{topic_key}] 처리 중 오류: {e}")
-
-
-def send_promos():
-    """(보류) 홍보 메시지: 모든 활성 토픽의 채널로 각자 전송.
-
-    현재 스케줄에서 제외됨 — 명령 안내(send_help)로 교체. 되돌리려면 main.py 의
-    스케줄 등록을 send_help → send_promos 로 바꾸면 된다.
-    """
-    for topic_key, profile in active_topics().items():
-        messages = profile.get("promo") or []
-        if not messages:
-            continue
-        try:
-            telegram.send_promo(profile["bot_token"], profile["chat_ids"], messages)
-            logger.info(f"[{topic_key}] 홍보 메시지 전송 완료")
-        except Exception as e:
-            logger.error(f"[홍보:{topic_key}] 처리 중 오류: {e}")
