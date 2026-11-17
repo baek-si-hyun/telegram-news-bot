@@ -32,9 +32,10 @@ TIMEOUT = 8
 MAX_WORKERS = 8
 MAX_BODY_CHARS = 2000
 
+# 브라우저로 위장하지 않고 봇임을 밝힌다. 이 UA 를 막는 사이트는 본문 없이 스니펫으로 판정한다
+# (막힌다고 헤더를 바꿔 우회하지 않는다).
 _HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "User-Agent": "telegram-news-bot/1.0 (+https://github.com/baek-si-hyun/telegram-news-bot)",
     "Accept-Language": "ko-KR,ko;q=0.9",
 }
 

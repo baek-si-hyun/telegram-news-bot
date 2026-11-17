@@ -5,7 +5,10 @@
 
 ※ 접근 주의
   세션 쿠키(TMOSHCooKie)를 보존하지 않으면 서버가 같은 URL로 307을 무한 반복한다.
-  requests.Session + 브라우저 User-Agent 조합이면 정상 200. (robots.txt 상 /USR/NEWS/ 허용)
+  requests.Session 이 첫 307 에서 심어 주는 쿠키를 유지하면 정상 200 — 브라우저 UA 위장은
+  필요 없다(2026-11-17 봇 UA 로 실측). robots.txt 상 /USR/NEWS/ 허용.
+  공식 대체 경로는 없다: 정책브리핑 RSS 는 2026-07-01 종료, data.go.kr 에 국토부 보도자료 API 없음,
+  molit 자체 RSS(board_rss.jsp?rss_id=NEWS)는 담당부서가 없고 최근 10건뿐이다.
 
 ※ 분류 주의
   국토부 자체 '분야'는 '도로철도'(철도+도로 합침) / '주택토지'(택지+주택 합침) 라서
@@ -32,10 +35,8 @@ logger = logging.getLogger(__name__)
 
 LIST_URL = "https://www.molit.go.kr/USR/NEWS/m_71/lst.jsp"
 
-_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-)
+# 브라우저로 위장하지 않고 봇임을 밝힌다 (307 루프는 UA 가 아니라 세션 쿠키로 푼다).
+_UA = "telegram-news-bot/1.0 (+https://github.com/baek-si-hyun/telegram-news-bot)"
 
 # 목록에서 한 번에 가져올 건수 (30분 주기라 넉넉)
 LIST_SIZE = 30

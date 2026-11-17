@@ -2,7 +2,7 @@
 
 네이버 뉴스 Open API + 국토교통부 보도자료를 30분마다 수집 → 판정 → 중복 제거 → 토픽별 텔레그램 채널로
 즉시 전송하는 Python 봇. 프론트 없음. 한 프로세스가 여러 토픽(`sto`, `realestate`)을 돈다.
-아래는 전부 코드에서 확인한 사실이고 근거를 `파일:줄`로 단다. **README 는 일부가 낡았다**(맨 아래 표).
+아래는 전부 코드에서 확인한 사실이고 근거를 `파일:줄`로 단다. README 는 2026-11-17 에 코드 기준으로 정정했다 — 둘이 어긋나면 코드가 맞다.
 
 ## 실행 · 검사
 
@@ -100,22 +100,15 @@
 ## 외부 접근 주의
 
 - 네이버는 공식 Open API(`openapi.naver.com/v1/search/news`, crawler/naver.py:15). 키워드당 30건·1.5초 간격(config.py:28-30), 429 는 지수 백오프(naver.py:125-128).
-- 기존 코드에 브라우저 UA 가 박혀 있다: 국토부(crawler/molit.py:35-38 — 세션 쿠키 없으면 307 반복, robots.txt 상 /USR/NEWS/ 허용이라고 주석 crawler/molit.py:6-8),
-  본문 수집(crawler/body.py:35-39). **봇 차단(403·챌린지)을 UA·헤더 위장으로 우회하는 코드를 새로 넣지 않는다.** 막히면 공식 경로를 찾는다.
+- 외부 요청 UA 는 봇임을 밝힌다(`telegram-news-bot/1.0 (+repo URL)`): 국토부 crawler/molit.py:39, 본문 수집 crawler/body.py:37-40.
+  **봇 차단(403·챌린지)을 UA·헤더 위장으로 우회하지 않는다.** 본문이 막히면 스니펫 판정으로 폴백한다(scheduler.py:49-51).
+- 국토부는 세션 쿠키 유지가 필수(첫 307 에서 쿠키를 심는다, crawler/molit.py:6-9). 담당부서를 주는 공식 대체 경로는 없다
+  — 정책브리핑 RSS 종료, data.go.kr 에 국토부 보도자료 API 없음, molit RSS 는 담당부서 없음·10건 (crawler/molit.py:10-11).
+- 국토부 동작 확인 때 `molit.fetch_new()` 를 부르지 않는다 — 운영 `storage/realestate/molit_seen.json` 에 '본 것'을 찍어 실제 전송이 빠진다
+  (crawler/molit.py:205). `_fetch_list`·`_fetch_dept`·`classify` 만 쓴다.
 
 ## 운영 수칙
 
 - 이 PC 는 운영 서버다. 평일 14:45~15:15 · 19:30~19:50 에는 빌드·`docker compose` 재기동·무거운 작업 금지.
 - 돌고 있는 컨테이너를 멈추거나 재기동하지 않는다(필요하면 팀장에게).
 - 미해결(사용자만 가능): 봇 토큰 재발급 + 토픽별 토큰 분리(`.env.example:1-7`).
-
-## README 와 코드가 다른 곳 (코드가 맞다)
-
-| README | 코드 |
-|---|---|
-| 명령 안내 "매일 13:05" (README.md:46, 128) | 주 1회 월요일 13:05 (config.py:33-34, main.py:73) |
-| ML 은 점수 필터 통과분에 대한 보조, 확률 < 0.3 컷 (README.md:63, 186-198) | 모델이 점수 임계값을 대체, 컷오프는 모델 메타·토픽 설정 (naver.py:255-280) |
-| 히스토리에서 `ml_relevant_terms` 로 자동 라벨링, 각 50건 (README.md:196-197) | `ml/data/<topic>.jsonl` 독립 라벨, 클래스당 150건 (ml/train_model.py:20, 62) |
-| 네이버 캐시 7일 (README.md:74) | 45일 (config.py:26) |
-| 5단 필터, 신선도 게이트 없음 (README.md:54-63) | 신선도 게이트가 맨 앞 (naver.py:209-215) |
-| 통과·탈락 "전부" 히스토리 기록 (README.md:65) | `not_press` 는 기록 안 함, URL 당 1행 (naver.py:66-81) |
