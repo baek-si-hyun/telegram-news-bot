@@ -16,3 +16,5 @@ storage/
 .dockerignore
 Dockerfile
 docker-compose.yml
+.env
+.venv
