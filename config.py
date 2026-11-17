@@ -329,6 +329,17 @@ TOPICS: dict[str, dict] = {
 }
 
 
+# ──────────────────────────────────────────────
+# 부동산 수집 원천 스위치 (오늘장 연동, 명세 C:/workspace/_wt/_specs/realestate-news-bridge.md 8장)
+#   direct — 지금과 같다: 네이버·국토부를 봇이 직접 수집 (기본값)
+#   shadow — 오늘장 피드를 받아 건수·URL 겹침만 로그로 비교한다. 판정·전송은 direct, 피드 쪽은 아무것도 쓰지 않는다
+#   invest — 오늘장 피드를 원본으로 쓴다. 피드 실패·낡음이면 그 주기(그 소스)만 direct
+# compose environment 로만 바꾼다(.env 아님). 모르는 값이면 direct 로 동작한다(crawler/invest_feed.py).
+# ──────────────────────────────────────────────
+REALESTATE_SOURCE = (os.getenv("REALESTATE_SOURCE") or "direct").strip().lower()
+INVEST_NEWS_URL = (os.getenv("INVEST_NEWS_URL") or "http://invest-backend:5002").strip().rstrip("/")
+
+
 # ENABLED_TOPICS=sto,realestate 처럼 env로 토픽 on/off (미지정 시 전체 시도)
 _enabled_raw = os.getenv("ENABLED_TOPICS", "").strip()
 ENABLED_TOPICS = _split_csv(_enabled_raw) or list(TOPICS.keys())
