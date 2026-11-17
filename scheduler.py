@@ -1,6 +1,6 @@
 import logging
 import unified
-from crawler import naver, molit, body
+from crawler import naver, molit, body, invest_feed
 from bot import telegram, commands
 from ml import classifier
 from storage import cache, pending, heartbeat, keywords as kwstore
@@ -67,16 +67,41 @@ def _refine_with_body(news_list: list[dict], topic_key: str, profile: dict) -> l
     return kept
 
 
-def _collect_topic(topic_key: str, profile: dict):
-    """단일 토픽 수집: 뉴스 검색 → 중복 제거 → 본문 재판정 → 대기 큐 저장"""
+def _collect_topic(topic_key: str, profile: dict, feed=None, shadow=None):
+    """단일 토픽 수집: 뉴스 검색 → 중복 제거 → 본문 재판정 → 대기 큐 저장
+
+    feed:   (부동산 · invest 모드) 오늘장 피드. 네이버가 신선하면 피드 목록에 있는 쿼리는 피드 원본으로
+            판정하고, 없는 쿼리(/add 키워드 · 목록 불일치)만 직접 받는다. None 이면 지금과 같다.
+    shadow: (부동산 · shadow 모드) 비교만 할 피드. 판정·전송은 직접 수집 그대로이고 로그만 남긴다.
+    """
+    # 봇 기본 키워드의 쿼리 (config). 피드 목록 불일치는 이것만 따진다 — /add 키워드는 원래 피드에 없다.
+    default_queries = set(profile.get("keywords", {}).values())
     # 사용자가 /add·/del 로 넣고 뺀 키워드를 config 위에 병합(매 주기 최신 반영)
     profile = kwstore.apply(profile, topic_key)
     logger.info(f"[{topic_key}] 뉴스 수집 시작 (키워드 {len(profile['keywords'])}개)")
     collected_this_cycle = set()
 
+    use_feed = feed is not None and feed.naver_fresh
+    if use_feed:
+        invest_feed.note_mismatch([q for q in profile["keywords"].values()
+                                   if q in default_queries and q not in feed.queries])
+    shadow_raw = {} if shadow is not None else None
+
     for keyword, query in profile["keywords"].items():
         try:
-            results = naver.search(keyword, query, profile, topic_key)
+            results = None
+            if use_feed and query in feed.queries:
+                try:
+                    results = naver.search(keyword, query, profile, topic_key,
+                                           raw_items=feed.naver_by_query.get(query, []))
+                except Exception as e:  # noqa: BLE001 — 피드 원본이 이상하면 그 키워드만 직접 받는다
+                    logger.error(f"[invest-feed] '{keyword}' 피드 원본 판정 오류 — 직접 수집: {e}")
+                    results = None
+            if results is None:
+                raw_out = None
+                if shadow_raw is not None and query in shadow.queries:
+                    raw_out = shadow_raw.setdefault(query, [])
+                results = naver.search(keyword, query, profile, topic_key, raw_out=raw_out)
         except Exception as e:
             logger.error(f"[수집:{topic_key}] '{keyword}' 검색 오류: {e}")
             continue
@@ -109,10 +134,16 @@ def _collect_topic(topic_key: str, profile: dict):
 
         logger.info(f"[{topic_key}] '{keyword}' {len(new_news)}건 수집")
 
+    if shadow_raw is not None:
+        try:
+            invest_feed.shadow_compare_naver(topic_key, shadow_raw, shadow)
+        except Exception as e:  # noqa: BLE001 — 비교 로그가 수집을 막지 않는다
+            logger.error(f"[invest-feed] shadow 네이버 비교 오류: {e}")
+
     logger.info(f"[{topic_key}] 뉴스 수집 완료")
 
 
-def _send_topic(topic_key: str, profile: dict):
+def _send_topic(topic_key: str, profile: dict, sent_urls: list | None = None):
     """단일 토픽 전송: 대기 큐 → 해당 토픽 텔레그램 채널.
 
     큐를 미리 비우지 않고(peek), 전송에 성공한 건만 제거한다. 예전에는 pop_all 로
@@ -130,6 +161,8 @@ def _send_topic(topic_key: str, profile: dict):
         for news in news_list:
             if telegram.send_news(news, profile["bot_token"], profile["chat_ids"]):
                 sent_items.append(news)
+                if sent_urls is not None:
+                    sent_urls.append(news.get("url"))
                 # 통합 포스팅 앱에도 같이 적는다. 실패해도 여기서 멈추지 않는다(unified.push 는 예외를 올리지 않는다).
                 unified.push(news, topic_key)
     finally:
@@ -141,17 +174,33 @@ def _send_topic(topic_key: str, profile: dict):
     logger.info(f"[{topic_key}] 텔레그램 전송 완료: {len(sent_items)}/{len(news_list)}건")
 
 
-def _molit_topic(topic_key: str, profile: dict):
+def _molit_topic(topic_key: str, profile: dict, feed=None, sent_urls: list | None = None, shadow=None):
     """국토부 보도자료 수집 → 즉시 전송 (뉴스보다 먼저, 카테고리 우선순위 순).
 
     네이버 뉴스와 달리 관련성 점수 필터를 태우지 않는다 — 국토부 공식 발표이고
     담당부서로 이미 선별되므로, 점수 필터에 걸려 잘리면 안 된다.
+
+    feed:   (invest 모드) 국토부 피드가 신선하면 국토부 사이트 대신 피드 행(담당부서 조회 끝)을 쓴다.
+    shadow: (shadow 모드) 직접 수집 뒤 피드와 비교해 로그만 남긴다.
     """
     categories = profile.get("molit_categories") or []
     if not categories:
         return
 
-    items = molit.fetch_new(topic_key, categories)
+    items = None
+    if feed is not None and feed.molit_fresh:
+        try:
+            items = molit.fetch_from_items(topic_key, categories, feed.molit)
+        except Exception as e:  # noqa: BLE001 — 피드 행이 이상하면 이번 주기는 직접 수집
+            logger.error(f"[invest-feed] 국토부 피드 처리 오류 — 직접 수집: {e}")
+            items = None
+    if items is None:
+        items = molit.fetch_new(topic_key, categories)
+        if shadow is not None:
+            try:
+                invest_feed.shadow_compare_molit(topic_key, shadow, cache.filter_new_urls)
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"[invest-feed] shadow 국토부 비교 오류: {e}")
     if not items:
         return
 
@@ -160,6 +209,8 @@ def _molit_topic(topic_key: str, profile: dict):
     for news in items:
         if telegram.send_news(news, profile["bot_token"], profile["chat_ids"]):
             sent += 1
+            if sent_urls is not None:
+                sent_urls.append(news.get("url"))
             # 국토부 보도자료도 앱으로 같이 넘긴다 — history JSONL 에는 네이버 기사만 남아서,
             # 여기서 안 넘기면 앱의 부동산 목록에서 보도자료만 통째로 빠진다.
             unified.push(news, topic_key)
@@ -185,27 +236,48 @@ def run_cycle():
     (과거에는 08:00/13:00/19:00 배치 전송이었으나, 속보성을 위해 즉시 전송으로 변경)
     """
     for topic_key, profile in active_topics().items():
+        # 부동산만: 오늘장 피드 사용 여부 결정(REALESTATE_SOURCE). 다른 토픽은 None — 지금과 같다.
+        # 피드 쪽 실패·낡음은 invest_feed 가 로그로만 남긴다(_alert 를 부르지 않는다).
+        cyc = invest_feed.begin(topic_key)
+        feed = cyc.feed if cyc else None
+        shadow = cyc.shadow if cyc else None
+        sent_urls = cyc.sent_urls if cyc else None
         try:
-            _molit_topic(topic_key, profile)
-        except Exception as e:
-            logger.error(f"[MOLIT:{topic_key}] 처리 중 오류: {e}")
-            _alert(topic_key, profile, f"국토부 보도자료 처리 실패: {e}")
-
-        try:
-            _collect_topic(topic_key, profile)
-        except Exception as e:
-            logger.error(f"[수집:{topic_key}] 처리 중 오류: {e}")
-            _alert(topic_key, profile, f"뉴스 수집 실패 — 이번 주기 건너뜀: {e}")
-            continue
-
-        try:
-            _send_topic(topic_key, profile)
-        except Exception as e:
-            logger.error(f"[전송:{topic_key}] 처리 중 오류: {e}")
-            _alert(topic_key, profile, f"텔레그램 전송 실패: {e}")
+            _run_topic(topic_key, profile, feed, shadow, sent_urls)
+        finally:
+            # 전송 성공분을 오늘장에 '보냄'으로 표시(토큰 파일 있을 때만, shadow 는 안 함)
+            invest_feed.finish(cyc)
 
     # 한 주기를 끝냈다는 표시. 다음 기동 때 이 시각과 비교해 정지 구간을 알아낸다.
     heartbeat.touch()
+
+
+def _run_topic(topic_key: str, profile: dict, feed, shadow, sent_urls) -> None:
+    """한 토픽: 국토부 → 수집 → 전송. feed/shadow/sent_urls 가 None 이면 예전 run_cycle 본문과 같다."""
+    try:
+        _molit_topic(topic_key, profile, feed, sent_urls, shadow)
+        # 국토부 피드를 실제로 썼고 예외 없이 끝났을 때만 국토부 커서를 넘긴다.
+        if feed is not None and feed.molit_fresh and feed.next_molit_cursor is not None:
+            invest_feed.save_cursor(topic_key, molit_cursor=feed.next_molit_cursor)
+    except Exception as e:
+        logger.error(f"[MOLIT:{topic_key}] 처리 중 오류: {e}")
+        _alert(topic_key, profile, f"국토부 보도자료 처리 실패: {e}")
+
+    try:
+        _collect_topic(topic_key, profile, feed, shadow)
+        # 네이버 피드를 실제로 썼고 토픽 수집이 예외 없이 끝났을 때만 네이버 커서를 넘긴다.
+        if feed is not None and feed.naver_fresh and feed.next_cursor is not None:
+            invest_feed.save_cursor(topic_key, cursor=feed.next_cursor)
+    except Exception as e:
+        logger.error(f"[수집:{topic_key}] 처리 중 오류: {e}")
+        _alert(topic_key, profile, f"뉴스 수집 실패 — 이번 주기 건너뜀: {e}")
+        return
+
+    try:
+        _send_topic(topic_key, profile, sent_urls)
+    except Exception as e:
+        logger.error(f"[전송:{topic_key}] 처리 중 오류: {e}")
+        _alert(topic_key, profile, f"텔레그램 전송 실패: {e}")
 
 
 def report_downtime(threshold_minutes: int = 90) -> None:
