@@ -29,6 +29,7 @@
 
 import logging
 import os
+import time
 
 import requests
 
@@ -43,6 +44,15 @@ TOPIC_MAP = {
 
 # 앱 서버가 느리거나 죽었을 때 이 봇이 붙잡히지 않도록. 전송 주기(30분) 안에서 수십 건이 돈다.
 TIMEOUT_SEC = 3
+
+# 실패 경고 간격. 앱 서버가 내려가 있으면 보내는 건마다 실패해 하루 ~70줄 경고가 쌓였다
+# (10-29~11-17 1,463줄, 전부 같은 연결 거부). 끊긴 순간 1회 + 이후 시간당 1회로 줄인다.
+WARN_INTERVAL_SEC = 3600
+
+# 실패 상태 (프로세스 수명 기준). push 는 스케줄러 스레드 하나에서만 불린다.
+_fail_since: float | None = None   # 연속 실패가 시작된 시각 (None = 정상)
+_last_warn = 0.0                   # 마지막으로 경고를 찍은 시각
+_suppressed = 0                    # 마지막 경고 뒤 찍지 않고 넘긴 실패 수
 
 
 def _config() -> tuple[str, str] | None:
@@ -96,10 +106,37 @@ def push(news: dict, topic_key: str) -> bool:
         )
         if res.status_code >= 400:
             # 본문을 통째로 로그에 붓지 않는다 — 앞부분만으로 원인은 충분히 드러난다.
-            logger.warning(f"[통합앱:{topic_key}] 적재 거절 {res.status_code}: {res.text[:200]}")
+            _on_failure(topic_key, f"적재 거절 {res.status_code}: {res.text[:200]}")
             return False
+        _on_success(topic_key)
         return True
     except Exception as e:  # noqa: BLE001
         # 앱 서버가 없는 것은 이 봇에게 정상 상태다. 오류로 올리지 않는다.
-        logger.warning(f"[통합앱:{topic_key}] 적재 실패: {e}")
+        _on_failure(topic_key, f"적재 실패: {e}")
         return False
+
+
+def _on_failure(topic_key: str, reason: str) -> None:
+    """실패 경고는 끊긴 순간 1회, 그 뒤로는 WARN_INTERVAL_SEC 마다 1회만 찍는다."""
+    global _fail_since, _last_warn, _suppressed
+    now = time.monotonic()
+    if _fail_since is None:
+        _fail_since, _last_warn, _suppressed = now, now, 0
+        logger.warning(f"[통합앱:{topic_key}] {reason} (이후 같은 실패는 {WARN_INTERVAL_SEC // 60}분에 1회만 기록)")
+        return
+    if now - _last_warn >= WARN_INTERVAL_SEC:
+        minutes = int((now - _fail_since) // 60)
+        logger.warning(f"[통합앱:{topic_key}] 여전히 실패 — {minutes}분째, 그사이 {_suppressed + 1}건 실패: {reason}")
+        _last_warn, _suppressed = now, 0
+        return
+    _suppressed += 1
+
+
+def _on_success(topic_key: str) -> None:
+    """실패 상태였다면 복구를 1회 알리고 상태를 되돌린다 (다시 끊기면 처음 1회부터)."""
+    global _fail_since, _suppressed
+    if _fail_since is None:
+        return
+    minutes = int((time.monotonic() - _fail_since) // 60)
+    logger.info(f"[통합앱:{topic_key}] 적재 복구 — {minutes}분 만에 다시 적힌다")
+    _fail_since, _suppressed = None, 0
