@@ -67,8 +67,11 @@ def _refine_with_body(news_list: list[dict], topic_key: str, profile: dict) -> l
     return kept
 
 
-def _collect_topic(topic_key: str, profile: dict, feed=None, shadow=None):
+def _collect_topic(topic_key: str, profile: dict, feed=None, shadow=None) -> bool:
     """단일 토픽 수집: 뉴스 검색 → 중복 제거 → 본문 재판정 → 대기 큐 저장
+
+    반환: 피드 원본을 쓴 키워드가 전부 탈 없이 끝났는가(네이버 커서를 넘겨도 되는가).
+          피드 hit 은 한 번만 오므로, 하나라도 피드 판정에 실패했으면 커서를 넘기지 않는다.
 
     feed:   (부동산 · invest 모드) 오늘장 피드. 네이버가 신선하면 피드 목록에 있는 쿼리는 피드 원본으로
             판정하고, 없는 쿼리(/add 키워드 · 목록 불일치)만 직접 받는다. None 이면 지금과 같다.
@@ -82,6 +85,7 @@ def _collect_topic(topic_key: str, profile: dict, feed=None, shadow=None):
     collected_this_cycle = set()
 
     use_feed = feed is not None and feed.naver_fresh
+    feed_ok = True
     if use_feed:
         invest_feed.note_mismatch([q for q in profile["keywords"].values()
                                    if q in default_queries and q not in feed.queries])
@@ -97,6 +101,7 @@ def _collect_topic(topic_key: str, profile: dict, feed=None, shadow=None):
                 except Exception as e:  # noqa: BLE001 — 피드 원본이 이상하면 그 키워드만 직접 받는다
                     logger.error(f"[invest-feed] '{keyword}' 피드 원본 판정 오류 — 직접 수집: {e}")
                     results = None
+                    feed_ok = False
             if results is None:
                 raw_out = None
                 if shadow_raw is not None and query in shadow.queries:
@@ -141,6 +146,7 @@ def _collect_topic(topic_key: str, profile: dict, feed=None, shadow=None):
             logger.error(f"[invest-feed] shadow 네이버 비교 오류: {e}")
 
     logger.info(f"[{topic_key}] 뉴스 수집 완료")
+    return feed_ok
 
 
 def _send_topic(topic_key: str, profile: dict, sent_urls: list | None = None):
@@ -255,19 +261,17 @@ def run_cycle():
 def _run_topic(topic_key: str, profile: dict, feed, shadow, sent_urls) -> None:
     """한 토픽: 국토부 → 수집 → 전송. feed/shadow/sent_urls 가 None 이면 예전 run_cycle 본문과 같다."""
     try:
+        # 국토부는 커서를 쓰지 않는다(invest_feed.load_cursor 참고) — 중복은 molit seen 이 막는다.
         _molit_topic(topic_key, profile, feed, sent_urls, shadow)
-        # 국토부 피드를 실제로 썼고 예외 없이 끝났을 때만 국토부 커서를 넘긴다.
-        if feed is not None and feed.molit_fresh and feed.next_molit_cursor is not None:
-            invest_feed.save_cursor(topic_key, molit_cursor=feed.next_molit_cursor)
     except Exception as e:
         logger.error(f"[MOLIT:{topic_key}] 처리 중 오류: {e}")
         _alert(topic_key, profile, f"국토부 보도자료 처리 실패: {e}")
 
     try:
-        _collect_topic(topic_key, profile, feed, shadow)
-        # 네이버 피드를 실제로 썼고 토픽 수집이 예외 없이 끝났을 때만 네이버 커서를 넘긴다.
-        if feed is not None and feed.naver_fresh and feed.next_cursor is not None:
-            invest_feed.save_cursor(topic_key, cursor=feed.next_cursor)
+        feed_ok = _collect_topic(topic_key, profile, feed, shadow)
+        # 네이버 피드를 실제로 썼고, 토픽 수집이 예외 없이 끝났고, 피드 판정 실패가 없을 때만 커서를 넘긴다.
+        if feed is not None and feed.naver_fresh and feed_ok and feed.next_cursor is not None:
+            invest_feed.save_cursor(topic_key, feed.next_cursor)
     except Exception as e:
         logger.error(f"[수집:{topic_key}] 처리 중 오류: {e}")
         _alert(topic_key, profile, f"뉴스 수집 실패 — 이번 주기 건너뜀: {e}")

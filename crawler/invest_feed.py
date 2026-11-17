@@ -24,7 +24,9 @@
 - 이 모듈의 실패가 수집·전송을 막지 않는다 — 무슨 일이 있어도 예외를 올리지 않고 direct 로 돌아간다.
 - 토큰 값은 어디에도 찍지 않는다. 요청에 X-Forwarded-For 를 넣지 않고, 환경의 프록시도 타지 않는다.
 - 커서 파일은 원자적으로 쓴다(임시 파일 → os.replace). 지우면 최근 2시간부터 다시 받는다 —
-  중복은 sent 캐시가 막는다.
+  중복은 sent 캐시가 막는다. 커서는 네이버 hit 에만 쓴다. 국토부는 커서 없이 매번 최근분을 받는다
+  (item_id 가 담당부서 조회 전에 매겨져, 조회가 늦게 성공한 행을 id 커서가 건너뛰기 때문 — load_cursor).
+- 피드 행은 형식을 검사해 받는다(문자열 아닌 값·http(s) 아닌 링크·따옴표 든 링크는 버림).
 """
 
 import json
@@ -55,6 +57,9 @@ TIMEOUT = (3, 10)            # (연결, 읽기) 초
 PAGE_LIMIT = 500             # 네이버 hit 기준 한 쪽 크기 (오늘장 최대 1000)
 MAX_PAGES = 5                # has_more 여도 한 주기에 최대 5쪽
 MAX_AGE_MIN = 70             # as_of 가 이보다 오래되면 그 소스는 낡음 (오늘장 건너뛰는 창 최장 2회를 견디는 값)
+FUTURE_SKEW_MIN = 5          # as_of 가 이보다 더 미래면 시계·데이터 오류로 보고 낡음 처리
+CURSOR_MAX_AGE_HOURS = 6     # 커서가 이보다 오래 안 넘어갔으면(긴 장애·direct 지속) 버리고 '최근 2시간'부터 —
+                             # 밀린 수천 건의 옛 기사가 복구 직후 한꺼번에 나가지 않게 한다
 ACK_BATCH = 200              # ack 한 번에 보낼 URL 수 상한 (오늘장 입력 상한)
 ACK_URL_MAX = 2048           # URL 한 개 길이 상한 (오늘장 입력 상한)
 NOTICE_INTERVAL_SEC = 3600   # 같은 문제가 이어지면 이 간격으로만 다시 기록
@@ -135,31 +140,36 @@ def _valid_cursor(v) -> bool:
     return isinstance(v, int) and not isinstance(v, bool) and v >= 0
 
 
-def load_cursor(topic_key: str) -> dict:
-    """{"cursor": int|None, "molit_cursor": int|None}. 파일이 없거나 깨졌으면 둘 다 None(최근 2시간부터)."""
-    out = {"cursor": None, "molit_cursor": None}
+def load_cursor(topic_key: str) -> int | None:
+    """네이버 hit 커서. 파일이 없거나 깨졌거나 CURSOR_MAX_AGE_HOURS 보다 오래됐으면 None(최근 2시간부터).
+
+    국토부는 커서를 쓰지 않는다 — item_id 는 오늘장이 처음 본 순간(담당부서 조회 전) 매겨지므로,
+    앞 번호 행의 담당부서 조회가 늦게 성공하면 id 커서를 이미 지나쳐 영영 안 온다. 국토부는 매번
+    오늘장 기본 창(최근분)을 받고, 중복은 molit seen(URL 완전일치, 30일)이 막는다.
+    """
     try:
         with open(_cursor_path(topic_key), "r", encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, ValueError):
-        return out
-    if isinstance(data, dict):
-        for k in out:
-            if _valid_cursor(data.get(k)):
-                out[k] = data[k]
-    return out
+        return None
+    if not isinstance(data, dict) or not _valid_cursor(data.get("cursor")):
+        return None
+    try:
+        updated = datetime.fromisoformat(str(data.get("updated_at")))
+    except ValueError:
+        return None
+    if (datetime.now() - updated).total_seconds() > CURSOR_MAX_AGE_HOURS * 3600:
+        _notice("cursor_old", True, f"커서가 {CURSOR_MAX_AGE_HOURS}시간 넘게 안 넘어갔다 — 버리고 최근 2시간분부터 받는다")
+        return None
+    _notice("cursor_old", False)
+    return data["cursor"]
 
 
-def save_cursor(topic_key: str, *, cursor: int | None = None, molit_cursor: int | None = None) -> bool:
-    """주어진 커서만 갱신해 원자적으로 쓴다(임시 파일 → os.replace). 실패해도 예외를 올리지 않는다."""
-    if cursor is None and molit_cursor is None:
+def save_cursor(topic_key: str, cursor: int | None) -> bool:
+    """네이버 커서를 원자적으로 쓴다(임시 파일 → os.replace). 실패해도 예외를 올리지 않는다."""
+    if cursor is None:
         return False
-    data = load_cursor(topic_key)
-    if cursor is not None:
-        data["cursor"] = cursor
-    if molit_cursor is not None:
-        data["molit_cursor"] = molit_cursor
-    data["updated_at"] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    data = {"cursor": cursor, "updated_at": datetime.now().strftime("%Y-%m-%dT%H:%M:%S")}
     path = _cursor_path(topic_key)
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -191,8 +201,8 @@ class Feed:
     naver_fresh: bool = False                            # as_of.naver 가 MAX_AGE_MIN 안
     molit_fresh: bool = False
     next_cursor: int | None = None
-    next_molit_cursor: int | None = None
     pages: int = 0
+    dropped: int = 0                                     # 형식이 틀려 버린 행 수
 
 
 class FeedError(Exception):
@@ -223,12 +233,57 @@ def _age_minutes(iso: str | None) -> float | None:
     return (datetime.now(timezone.utc) - dt).total_seconds() / 60
 
 
-def _get_page(session: requests.Session, token: str, cursor, molit_cursor) -> dict:
+def _fresh(age: float | None) -> bool:
+    return age is not None and -FUTURE_SKEW_MIN <= age <= MAX_AGE_MIN
+
+
+_NAVER_TEXT_FIELDS = ("title", "description", "originallink", "link", "pubDate")
+_BAD_URL_CHARS = set('"<>\\ \t\r\n')
+
+
+def _ok_url(u) -> bool:
+    return (isinstance(u, str) and u.startswith(("http://", "https://")) and len(u) <= ACK_URL_MAX
+            and not (set(u) & _BAD_URL_CHARS))
+
+
+def _clean_naver_hit(it) -> dict | None:
+    """네이버 hit 한 행을 naver.search 가 받는 원본 모양으로. 형식이 틀리면 None(버림).
+
+    문자열이 아닌 값이 섞이면 판정·중복 제거 단계에서 예외가 나 토픽 수집 전체가 멈춘다.
+    링크는 http(s) 만, 따옴표·꺾쇠·공백이 든 것은 버린다(텔레그램 href 가 깨져 전송이 영구 실패한다).
+    """
+    if not isinstance(it, dict) or not isinstance(it.get("query"), str):
+        return None
+    row = {"query": it["query"]}
+    for k in _NAVER_TEXT_FIELDS:
+        v = it.get(k)
+        if v is None:
+            v = ""
+        if not isinstance(v, str):
+            return None
+        row[k] = v
+    if not row["title"].strip() or not _ok_url(row["originallink"] or row["link"]):
+        return None
+    if row["originallink"] and not _ok_url(row["originallink"]):
+        return None
+    return row
+
+
+def _clean_molit_row(it) -> dict | None:
+    if not isinstance(it, dict):
+        return None
+    url, title, dept = it.get("url"), it.get("title"), it.get("dept")
+    if not _ok_url(url) or not isinstance(title, str) or not title.strip() or not isinstance(dept, str):
+        return None
+    return {"url": url, "title": title, "dept": dept,
+            "field": it.get("field") if isinstance(it.get("field"), str) else "",
+            "pub_date": it.get("pub_date") if isinstance(it.get("pub_date"), str) else ""}
+
+
+def _get_page(session: requests.Session, token: str, cursor) -> dict:
     params = {"limit": PAGE_LIMIT}
     if cursor is not None:
         params["cursor"] = cursor
-    if molit_cursor is not None:
-        params["molit_cursor"] = molit_cursor
     try:
         res = session.get(f"{INVEST_NEWS_URL}{FEED_PATH}", params=params, headers=_headers(token),
                           timeout=TIMEOUT, allow_redirects=False)
@@ -248,53 +303,71 @@ def _get_page(session: requests.Session, token: str, cursor, molit_cursor) -> di
 
 
 def _fetch(topic_key: str, token: str, use_cursor: bool) -> Feed:
-    cur = load_cursor(topic_key) if use_cursor else {"cursor": None, "molit_cursor": None}
-    cursor, molit_cursor = cur["cursor"], cur["molit_cursor"]
+    """피드를 받는다. 첫 쪽이 실패하면 FeedError(토픽 전체 direct).
+
+    2쪽부터 실패하면 이미 받은 쪽까지만 쓰고 그 쪽의 next_cursor 까지만 넘긴다 — 큰 밀림에서 특정 쪽이
+    계속 실패해도 커서가 조금씩은 나아가게.
+    """
+    cursor = load_cursor(topic_key) if use_cursor else None
     feed = Feed()
     seen_molit = set()
     session = _session()
     try:
         for page in range(MAX_PAGES):
-            data = _get_page(session, token, cursor, molit_cursor)
-            naver = data.get("naver")
-            molit = data.get("molit")
-            queries = data.get("queries")
-            if not isinstance(naver, list) or not isinstance(molit, list) or not isinstance(queries, list):
-                raise FeedError("응답 형식 오류(naver·molit·queries)")
-            nc, nmc = data.get("next_cursor"), data.get("next_molit_cursor")
-            if (nc is not None and not _valid_cursor(nc)) or (nmc is not None and not _valid_cursor(nmc)):
-                raise FeedError("응답 형식 오류(커서)")
+            try:
+                data = _get_page(session, token, cursor)
+                naver = data.get("naver")
+                molit = data.get("molit")
+                queries = data.get("queries")
+                if not isinstance(naver, list) or not isinstance(molit, list) or not isinstance(queries, list):
+                    raise FeedError("응답 형식 오류(naver·molit·queries)")
+                nc = data.get("next_cursor")
+                if nc is not None and not _valid_cursor(nc):
+                    raise FeedError("응답 형식 오류(커서)")
+            except FeedError as e:
+                if page == 0:
+                    raise
+                _notice("page", True, f"{page + 1}쪽 실패({e}) — 받은 {page}쪽까지만 쓴다")
+                break
             if page == 0:
+                _notice("page", False)
                 as_of = data.get("as_of") if isinstance(data.get("as_of"), dict) else {}
-                age_n, age_m = _age_minutes(as_of.get("naver")), _age_minutes(as_of.get("molit"))
-                feed.naver_fresh = age_n is not None and age_n <= MAX_AGE_MIN
-                feed.molit_fresh = age_m is not None and age_m <= MAX_AGE_MIN
+                feed.naver_fresh = _fresh(_age_minutes(as_of.get("naver")))
+                feed.molit_fresh = _fresh(_age_minutes(as_of.get("molit")))
                 feed.queries = {q for q in queries if isinstance(q, str)}
                 _notice("stale_naver", not feed.naver_fresh,
-                        f"네이버 피드 낡음(as_of {as_of.get('naver')}) — 네이버는 직접 수집",
+                        f"네이버 피드 낡음(as_of {str(as_of.get('naver'))[:40]}) — 네이버는 직접 수집",
                         "네이버 피드 정상 — 오늘장 피드 사용")
                 _notice("stale_molit", not feed.molit_fresh,
-                        f"국토부 피드 낡음(as_of {as_of.get('molit')}) — 국토부는 직접 수집",
+                        f"국토부 피드 낡음(as_of {str(as_of.get('molit'))[:40]}) — 국토부는 직접 수집",
                         "국토부 피드 정상 — 오늘장 피드 사용")
             for it in naver:
-                if isinstance(it, dict) and isinstance(it.get("query"), str):
-                    feed.naver_by_query.setdefault(it["query"], []).append(it)
+                row = _clean_naver_hit(it)
+                if row is None:
+                    feed.dropped += 1
+                    continue
+                feed.naver_by_query.setdefault(row["query"], []).append(row)
             for it in molit:
-                if isinstance(it, dict):
-                    key = it.get("item_id", it.get("url"))
-                    if key in seen_molit:
-                        continue
-                    seen_molit.add(key)
-                    feed.molit.append(it)
+                row = _clean_molit_row(it)
+                if row is None:
+                    feed.dropped += 1
+                    continue
+                if row["url"] in seen_molit:
+                    continue
+                seen_molit.add(row["url"])
+                feed.molit.append(row)
             feed.pages = page + 1
+            if nc is not None and cursor is not None and nc < cursor:
+                # 오늘장 표가 새로 만들어졌거나 번호가 되감겼다 — 서버 값을 따른다(중복은 sent 캐시가 막는다).
+                logger.warning(f"[invest-feed] 커서 역행 {cursor} → {nc} — 서버 값을 따른다")
+            progressed = nc is not None and nc != cursor
             if nc is not None:
                 feed.next_cursor = cursor = nc
-            if nmc is not None:
-                feed.next_molit_cursor = molit_cursor = nmc
-            if data.get("has_more") is not True:
+            if data.get("has_more") is not True or not progressed:
                 break
     finally:
         session.close()
+    _notice("dropped", feed.dropped > 0, f"형식이 틀린 피드 행 {feed.dropped}건을 버렸다")
     return feed
 
 
@@ -313,6 +386,7 @@ def begin(topic_key: str) -> Cycle | None:
     """토픽 주기 시작. 부동산이 아니면 None(아무것도 안 함). 절대 예외를 올리지 않는다."""
     if topic_key != FEED_TOPIC:
         return None
+    m, token = "direct", None
     try:
         m = mode()
         cyc = Cycle(topic_key=topic_key, mode=m)
@@ -342,8 +416,9 @@ def begin(topic_key: str) -> Cycle | None:
             _notice("feed", True, f"피드 실패({e}) — 이번 주기 부동산 전체 직접 수집")
         return cyc
     except Exception as e:  # noqa: BLE001 — 피드 쪽 어떤 문제도 수집을 막지 않는다
-        logger.error(f"[invest-feed] 피드 준비 중 예외 — 직접 수집: {type(e).__name__}: {e}")
-        return Cycle(topic_key=topic_key)
+        logger.error(f"[invest-feed] 피드 준비 중 예외 — 직접 수집: {type(e).__name__}")
+        # 피드는 못 써도 보낸 기사의 '보냄' 표시는 계속한다(shadow 는 원래 안 함).
+        return Cycle(topic_key=topic_key, mode=m, ack_enabled=token is not None and m != "shadow")
 
 
 def note_mismatch(missing_queries: list[str]) -> None:
