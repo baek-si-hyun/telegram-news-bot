@@ -138,11 +138,15 @@ def _fetch(query: str, retry: int = 3) -> list[dict]:
     return []
 
 
-def search(keyword: str, query: str, profile: dict, topic_key: str) -> list[dict]:
+def search(keyword: str, query: str, profile: dict, topic_key: str,
+           raw_items: list[dict] | None = None, raw_out: list | None = None) -> list[dict]:
     """
     네이버 뉴스 검색 후 (토픽 프로필 기준) 정제된 뉴스 목록 반환
 
     profile: config.TOPICS[topic_key] (positive_weights/negative_weights/threshold/strict_match)
+    raw_items: 네이버 응답 원본(items)을 밖에서 받았을 때만 넘긴다(오늘장 피드). 주어지면 네이버를
+               부르지 않고 키워드 간 대기(REQUEST_DELAY_SECONDS)도 건너뛴다. 거르기·히스토리 기록은 같다.
+    raw_out:   (shadow 비교용) 넘기면 이번에 받은 원본 items 를 여기에 덧붙인다. 판정에는 영향 없다.
     반환 형식:
     [{"source": "naver", "keyword": ..., "title": ..., "url": ...}, ...]
     """
@@ -177,7 +181,11 @@ def search(keyword: str, query: str, profile: dict, topic_key: str) -> list[dict
     merged_weights = {**positive_weights, **negative_weights}
     terms_by_length = sorted(merged_weights, key=len, reverse=True)
 
-    raw_items = _fetch(query)
+    from_feed = raw_items is not None
+    if not from_feed:
+        raw_items = _fetch(query)
+    if raw_out is not None:
+        raw_out.extend(raw_items)
     results = []
     history_records = []
     now = datetime.now().isoformat()
@@ -311,6 +319,10 @@ def search(keyword: str, query: str, profile: dict, topic_key: str) -> list[dict
     if history_records:
         history.save_batch(history_records, topic_key)
 
+    if from_feed:
+        # 네이버를 부르지 않았으니 키워드 간 대기도 필요 없다.
+        logger.info(f"[Naver:{topic_key}] '{keyword}'(쿼리: '{query}', 오늘장 피드) 결과: {len(results)}건 (전체 {len(raw_items)}건 중)")
+        return results
     logger.info(f"[Naver:{topic_key}] '{keyword}'(쿼리: '{query}') 결과: {len(results)}건 (전체 {len(raw_items)}건 중)")
     time.sleep(REQUEST_DELAY_SECONDS)
     return results

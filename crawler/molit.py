@@ -213,3 +213,72 @@ def fetch_new(topic_key: str, categories: list[str]) -> list[dict]:
         + ", ".join(f"{n['category']}" for n in results)
     )
     return results
+
+
+def fetch_from_items(topic_key: str, categories: list[str], items: list[dict]) -> list[dict]:
+    """오늘장 피드가 준 보도자료(담당부서 조회까지 끝난 행)로 fetch_new 와 같은 결과를 만든다.
+
+    국토부 사이트를 부르지 않는다 — 목록·상세 조회는 오늘장이 했다. 그 뒤는 fetch_new 와 같다:
+    URL 완전일치 신규 판별(molit seen) → classify(담당부서, 제목) → seen 기록 → 우선순위 정렬.
+    URL 은 정규화하지 않고 그대로 쓴다(오늘장도 urljoin(LIST_URL, href) 그대로 저장한다 —
+    직접 수집과 같은 키가 나와야 원천이 바뀌어도 두 번 나가지 않는다).
+
+    dept 가 None 인 행(상세 미조회·실패)은 받지 않는다 — 오늘장이 다시 조회한 뒤에 다시 온다.
+    seen 에도 기록하지 않으므로 '실패분은 seen 에 기록하지 않음' 불변조건이 유지된다.
+    """
+    listed = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        url = it.get("url")
+        title = it.get("title")
+        dept = it.get("dept")
+        if not isinstance(url, str) or not url or not isinstance(title, str) or not title.strip():
+            continue
+        if not isinstance(dept, str):
+            continue
+        listed.append({
+            "title": " ".join(title.split()),
+            "url": url,
+            "field": it.get("field") or "",
+            "pub_date": it.get("pub_date") or "",
+            "dept": dept.strip(),
+        })
+
+    if not listed:
+        logger.info(f"[MOLIT:{topic_key}] 오늘장 피드: 새 보도자료 없음")
+        return []
+
+    fresh = cache.filter_new_urls(listed, topic_key, SEEN_NS)
+    if not fresh:
+        logger.info(f"[MOLIT:{topic_key}] 신규 보도자료 없음 (오늘장 피드 {len(listed)}건)")
+        return []
+
+    results = []
+    for item in fresh:
+        dept = item["dept"]
+        category = classify(dept, item["title"])
+        if category not in categories:
+            logger.info(
+                f"[MOLIT:{topic_key}] 제외(대상 외: {category or '미분류'}, 부서={dept or '?'}): {item['title'][:40]}"
+            )
+            continue
+        results.append({
+            "source": "molit",
+            "category": category,
+            "dept": dept,
+            "title": item["title"],
+            "url": item["url"],
+        })
+
+    # 피드 행은 전부 담당부서까지 조회된 것이라 모두 '본 것'으로 기록한다.
+    cache.mark_urls_sent(fresh, topic_key, SEEN_NS)
+
+    order = {c: i for i, c in enumerate(categories)}
+    results.sort(key=lambda n: order.get(n["category"], len(order)))
+
+    logger.info(
+        f"[MOLIT:{topic_key}] 오늘장 피드 신규 {len(fresh)}건 중 대상 {len(results)}건: "
+        + ", ".join(f"{n['category']}" for n in results)
+    )
+    return results
