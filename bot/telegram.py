@@ -40,7 +40,24 @@ def mask_token(text) -> str:
 
 
 def _escape_html(text: str) -> str:
+    """본문 텍스트용 이스케이프 (텔레그램 HTML 모드)."""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _escape_attr(text: str) -> str:
+    """속성값(href="...")용 이스케이프. 본문용에 더해 " 까지 바꾼다.
+
+    본문용만 쓰면 URL 에 " 가 든 기사는 href 가 중간에 닫혀 텔레그램이 400 을 내고,
+    네이버 기사는 대기 큐에 남아 매 주기 재전송에 실패했다.
+    """
+    return _escape_html(text).replace('"', "&quot;")
+
+
+def _link(url: str, inner_html: str) -> str:
+    """http(s) 링크만 <a> 로 감싼다. 그 밖(javascript: · 빈 값 등)은 링크 없이 제목만 보낸다."""
+    if isinstance(url, str) and url.lower().startswith(("http://", "https://")):
+        return f'<a href="{_escape_attr(url)}">{inner_html}</a>'
+    return inner_html
 
 
 def _prefix(news: dict) -> str:
@@ -55,8 +72,7 @@ def _prefix(news: dict) -> str:
 
 def _build_message(news: dict) -> str:
     title = _escape_html(news.get("title", "(제목 없음)"))
-    url = _escape_html(news.get("url", ""))
-    return f'{_prefix(news)}<a href="{url}">{title}</a>'
+    return f'{_prefix(news)}{_link(news.get("url", ""), title)}'
 
 
 def _send_to_chat(bot_token: str, chat_id: str, text: str, retry: int = 3) -> bool:
@@ -115,14 +131,14 @@ def _send_request(bot_token: str, chat_ids: list[str], text: str) -> bool:
 def _build_caption(news: dict) -> str:
     """사진 캡션 (sendMessage 본문보다 짧은 1024자 제한)"""
     tag = _prefix(news).strip()
-    url = _escape_html(news.get("url", ""))
+    url = news.get("url", "")
     raw_title = news.get("title", "(제목 없음)")
 
-    caption = f'{tag}\n<a href="{url}">{_escape_html(raw_title)}</a>'
+    caption = f'{tag}\n{_link(url, _escape_html(raw_title))}'
     if len(caption) > MAX_CAPTION_LENGTH:
-        overhead = len(f'{tag}\n<a href="{url}">...</a>') + 10
+        overhead = len(f'{tag}\n{_link(url, "...")}') + 10
         cut = _escape_html(raw_title[:max(0, MAX_CAPTION_LENGTH - overhead)]) + "..."
-        caption = f'{tag}\n<a href="{url}">{cut}</a>'
+        caption = f'{tag}\n{_link(url, cut)}'
     return caption
 
 
@@ -210,10 +226,10 @@ def send_news(news: dict, bot_token: str, chat_ids: list[str]) -> bool:
         message = _build_message(news)
         if len(message) > MAX_MESSAGE_LENGTH:
             prefix = _prefix(news)
-            url = _escape_html(news.get("url", ""))
-            max_title_len = MAX_MESSAGE_LENGTH - len(f'{prefix}<a href="{url}">...</a>') - 10
+            url = news.get("url", "")
+            max_title_len = MAX_MESSAGE_LENGTH - len(f'{prefix}{_link(url, "...")}') - 10
             title = _escape_html(news.get("title", "")[:max(0, max_title_len)]) + "..."
-            message = f'{prefix}<a href="{url}">{title}</a>'
+            message = f'{prefix}{_link(url, title)}'
         success = _send_request(bot_token, chat_ids, message)
 
     if success:
