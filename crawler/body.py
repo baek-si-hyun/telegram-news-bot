@@ -19,6 +19,7 @@
 실패해도 흐름을 막지 않는다 — 본문을 못 받으면 스니펫 판정을 그대로 쓴다.
 """
 
+import json
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -40,26 +41,84 @@ _HEADERS = {
 }
 
 # 흔한 본문 컨테이너 (네이버 뉴스 + 국내 언론사 CMS 다수)
+# 언론사 전용 셀렉터는 범용(article 등)보다 앞에 둔다 — 범용이 먼저 걸리면 짧은 조각만 잡힌다.
+# 2026-11-19 보강: 정직 UA 로 200 을 받고도 본문을 못 뽑던 언론사들
+#   뉴스1 #articleBodyContent(s 없음) · 노컷 #pnlContent · YTN #CmAdContent ·
+#   동아 section.news_view · 스포츠동아 #article_body(id — .article_body 클래스와 다르다)
 _SELECTORS = [
-    "#dic_area", "#articleBodyContents", "#newsct_article", "#article-view-content-div",
+    "#dic_area", "#articleBodyContents", "#articleBodyContent", "#newsct_article",
+    "#article-view-content-div", "#pnlContent", "#CmAdContent", "section.news_view", "#article_body",
     "#articleBody", ".article-body", ".news_body", ".article_body", "article",
 ]
+_CONTAINER_CSS = ", ".join(_SELECTORS)
 
 _BOILERPLATE = re.compile(r"(무단전재|재배포\s*금지|저작권자|ⓒ|Copyright|기자\s*=|사진=).{0,80}")
 
 
+def _ld_article_body(soup: BeautifulSoup) -> str:
+    """구조화 데이터(JSON-LD)의 articleBody. 본문을 스크립트로 그리는 페이지의 마지막 수단.
+
+    description(요약)은 쓰지 않는다 — 스니펫과 같은 길이라 본문 모델에 넣을 이유가 없다.
+    """
+    for s in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(s.string or "")
+        except ValueError:
+            continue
+        for obj in (data if isinstance(data, list) else [data]):
+            body = obj.get("articleBody") if isinstance(obj, dict) else None
+            if isinstance(body, str) and len(body) > 200:
+                return body
+    return ""
+
+
+def _next_data_body(soup: BeautifulSoup) -> str:
+    """Next.js 페이지의 __NEXT_DATA__ 에 든 본문 문단. 뉴스1 은 본문 <p> 를 비워 두고 여기서 그린다
+    (props.pageProps.articleView.contentArrange[].content — 문단마다 HTML 조각)."""
+    s = soup.find("script", id="__NEXT_DATA__")
+    if not s:
+        return ""
+    try:
+        view = json.loads(s.string or "")["props"]["pageProps"]["articleView"]
+        blocks = view["contentArrange"]
+    except (ValueError, KeyError, TypeError):
+        return ""
+    if not isinstance(blocks, list):
+        return ""
+    parts = []
+    for b in blocks:
+        # 사진 블록(src 가 있는 것)의 content 는 캡션이라 뺀다
+        if isinstance(b, dict) and not b.get("src") and isinstance(b.get("content"), str):
+            parts.append(BeautifulSoup(b["content"], "html.parser").get_text(" ", strip=True))
+    text = " ".join(p for p in parts if p)
+    return text if len(text) > 200 else ""
+
+
 def _extract(html: str) -> str:
     soup = BeautifulSoup(html, "html.parser")
-    for bad in soup(["script", "style", "nav", "header", "footer", "aside", "form", "iframe"]):
+    # script 를 지우기 전에 읽는다
+    ld_body = _ld_article_body(soup) or _next_data_body(soup)
+    for bad in soup(["script", "style", "nav", "header", "footer", "aside", "iframe"]):
         bad.decompose()
+    # form 은 본문 컨테이너를 품지 않은 것만 지운다 — ASP.NET 언론사(노컷 등)는 페이지 전체가
+    # <form> 안이라 통째로 지우면 본문까지 사라진다. 나머지 form(좋아요·댓글 입력란)은 지운다.
+    for f in soup("form"):
+        if not f.select_one(_CONTAINER_CSS):
+            f.decompose()
     for sel in _SELECTORS:
         node = soup.select_one(sel)
         if node:
             txt = node.get_text(" ", strip=True)
-            if len(txt) > 200:
+            # 길이는 상투어(ⓒ·무단전재 …)를 걷어낸 뒤로 잰다 — 사진 캡션·저작권 줄만 든 껍데기
+            # 컨테이너(뉴스1 의 <article>)가 200자를 넘겨 진짜 본문 경로를 가로막았다.
+            if len(_BOILERPLATE.sub("", txt)) > 200:
                 return txt
+    for bad in soup("form"):   # 남은 form(본문 컨테이너를 품었지만 본문을 못 찾은 경우)도 <p> 폴백에선 뺀다
+        bad.decompose()
     paras = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
-    return " ".join(p for p in paras if len(p) > 20)
+    p_text = " ".join(p for p in paras if len(p) > 20)
+    # 구조화 데이터 본문과 <p> 모음 중 긴 쪽 — 데일리안처럼 articleBody 를 잘라 싣는 곳은 <p> 가 더 길다.
+    return ld_body if len(ld_body) > len(_BOILERPLATE.sub("", p_text)) else p_text
 
 
 def _clean(text: str) -> str:
