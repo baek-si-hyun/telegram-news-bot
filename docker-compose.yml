@@ -12,9 +12,30 @@ services:
       - ./logs:/app/logs
     environment:
       - TZ=Asia/Seoul
+      # 부동산 수집 원천: direct(지금과 같음, 기본) | shadow(오늘장 피드 건수만 비교 · 아무것도 안 씀) | invest(오늘장 피드 사용, 실패 · 낡음이면 그 주기만 direct)
+      # 바꿀 때는 이 줄만 고치고 재기동(총괄 시각 승인). 명세 C:/workspace/_wt/_specs/realestate-news-bridge.md
+      - REALESTATE_SOURCE=direct
+      - INVEST_NEWS_URL=http://invest-backend:5002
+    # 오늘장 전용 내부망(--internal). default 를 빼면 인터넷(네이버 · 텔레그램)과 끊긴다.
+    networks:
+      default: {}
+      news_bridge:
+        ipv4_address: 172.31.250.3
+    # 토큰은 저장소 밖 파일 — .env 에 넣지 않는다. 오늘장 compose 와 같은 파일
+    secrets:
+      - news_bridge_token
     healthcheck:
       test: ["CMD", "python", "-c", "import os, time; t=os.path.getmtime('/app/logs/bot.log'); exit(0 if time.time()-t < 3600 else 1)"]
       interval: 5m
       timeout: 10s
       retries: 3
       start_period: 1m
+
+networks:
+  news_bridge:
+    name: oneuljang-news
+    external: true
+
+secrets:
+  news_bridge_token:
+    file: C:/workspace/_secrets/news_bridge_token

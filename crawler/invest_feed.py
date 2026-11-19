@@ -62,6 +62,9 @@ CURSOR_MAX_AGE_HOURS = 6     # 커서가 이보다 오래 안 넘어갔으면(�
                              # 밀린 수천 건의 옛 기사가 복구 직후 한꺼번에 나가지 않게 한다
 ACK_BATCH = 200              # ack 한 번에 보낼 URL 수 상한 (오늘장 입력 상한)
 ACK_URL_MAX = 2048           # URL 한 개 길이 상한 (오늘장 입력 상한)
+BUSY_RETRIES = 2             # 503 BUSY(오늘장 읽기 자리 1개가 참) 때 쪽당 다시 시도 횟수 — 실패로 세지 않는다
+BUSY_WAIT_DEFAULT = 5        # Retry-After 가 없을 때 기다릴 초
+BUSY_WAIT_MAX = 10           # Retry-After 를 이 이상은 믿지 않는다(주기가 밀리지 않게)
 NOTICE_INTERVAL_SEC = 3600   # 같은 문제가 이어지면 이 간격으로만 다시 기록
 
 _UA = "telegram-news-bot/1.0 (+https://github.com/baek-si-hyun/telegram-news-bot)"
@@ -280,19 +283,49 @@ def _clean_molit_row(it) -> dict | None:
             "pub_date": it.get("pub_date") if isinstance(it.get("pub_date"), str) else ""}
 
 
+def _error_code(res) -> str:
+    """오늘장 오류 응답의 code(FORBIDDEN·BUSY·DISABLED·NOT_READY·…). 못 읽으면 ""."""
+    try:
+        data = res.json()
+    except ValueError:
+        return ""
+    code = data.get("code") if isinstance(data, dict) else None
+    return code if isinstance(code, str) else ""
+
+
+def _retry_after(res) -> float:
+    try:
+        sec = float(res.headers.get("Retry-After", BUSY_WAIT_DEFAULT))
+    except (TypeError, ValueError):
+        sec = BUSY_WAIT_DEFAULT
+    return min(max(sec, 0.0), BUSY_WAIT_MAX)
+
+
 def _get_page(session: requests.Session, token: str, cursor) -> dict:
+    """한 쪽 받기. 오늘장의 읽기 자리는 1개라, 503 BUSY 는 실패가 아니라 대기다 —
+    Retry-After 만큼 기다렸다 다시(쪽당 BUSY_RETRIES 회까지). 그래도 바쁘면 그때 실패로 본다."""
     params = {"limit": PAGE_LIMIT}
     if cursor is not None:
         params["cursor"] = cursor
-    try:
-        res = session.get(f"{INVEST_NEWS_URL}{FEED_PATH}", params=params, headers=_headers(token),
-                          timeout=TIMEOUT, allow_redirects=False)
-    except requests.Timeout:
-        raise FeedError("타임아웃")
-    except requests.RequestException as e:
-        raise FeedError(f"연결 실패({type(e).__name__})")
+    for attempt in range(BUSY_RETRIES + 1):
+        try:
+            res = session.get(f"{INVEST_NEWS_URL}{FEED_PATH}", params=params, headers=_headers(token),
+                              timeout=TIMEOUT, allow_redirects=False)
+        except requests.Timeout:
+            raise FeedError("타임아웃")
+        except requests.RequestException as e:
+            raise FeedError(f"연결 실패({type(e).__name__})")
+        if res.status_code == 503 and _error_code(res) == "BUSY" and attempt < BUSY_RETRIES:
+            time.sleep(_retry_after(res))
+            continue
+        break
+    if res.status_code == 403:
+        # 오늘장은 봇 고정 IP(내부망 oneuljang-news 의 172.31.250.3)가 아니면 무조건 403 이다 —
+        # 토큰이 아니라 망·주소 설정 문제다. 다시 해 봐야 같으니 이번 주기는 직접 수집.
+        raise FeedError("HTTP 403 — 봇 주소로 인정되지 않음(내부망·고정 IP 설정 확인)")
     if res.status_code != 200:
-        raise FeedError(f"HTTP {res.status_code}")
+        code = _error_code(res)
+        raise FeedError(f"HTTP {res.status_code}{(' ' + code) if code else ''}")
     try:
         data = res.json()
     except ValueError:

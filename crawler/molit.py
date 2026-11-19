@@ -250,6 +250,13 @@ def fetch_from_items(topic_key: str, categories: list[str], items: list[dict]) -
         return []
 
     fresh = cache.filter_new_urls(listed, topic_key, SEEN_NS)
+    # 오늘장은 국토부 링크를 https://www.molit.go.kr/ 로만 준다(절대 http 주소는 https 로 바꿔 싣는다).
+    # 직접 수집이 http 키로 seen 에 남긴 적이 있으면 같은 보도자료가 한 번 더 나간다 —
+    # 비교할 때만 http 쌍둥이도 본다(저장 형식은 그대로). 2026-11-20 기준 seen 92건은 전부 https.
+    fresh = [it for it in fresh
+             if not (it["url"].startswith("https://")
+                     and not cache.filter_new_urls([{"url": "http://" + it["url"][len("https://"):]}],
+                                                   topic_key, SEEN_NS))]
     if not fresh:
         logger.info(f"[MOLIT:{topic_key}] 신규 보도자료 없음 (오늘장 피드 {len(listed)}건)")
         return []
